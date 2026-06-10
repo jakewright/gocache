@@ -169,7 +169,7 @@ func (c *Cache[K, V]) LoadOrStore(ctx context.Context, key K, task Task[V]) (res
 				return
 			}
 
-			if len(c.entries) == c.maxSize {
+			if c.maxSize > 0 && len(c.entries) == c.maxSize {
 				c.evictRandomUnsafe()
 			}
 
