@@ -8,7 +8,98 @@ import (
 	"time"
 )
 
-func TestLoad_CacheMissHit(t *testing.T) {
+func TestLoad(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cacheCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		c := New[string, int](cacheCtx)
+
+		// Test that we initially get a cache miss
+		got, ok, err := c.Load(context.Background(), "key")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if ok {
+			t.Fatalf("unexpected cache hit")
+		}
+		if got != 0 {
+			t.Fatalf("got %v, want %v", got, 0)
+		}
+
+		// Store something in the cache
+		got, err = c.Store(context.Background(), "key", func(ctx context.Context) (int, time.Time, error) {
+			return 123, time.Now().Add(time.Hour), nil
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != 123 {
+			t.Fatalf("got %v, want %v", got, 123)
+		}
+
+		// Test that we get a cache hit
+		got, ok, err = c.Load(context.Background(), "key")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !ok {
+			t.Fatalf("expected cache hit")
+		}
+		if got != 123 {
+			t.Fatalf("got %v, want %v", got, 123)
+		}
+	})
+}
+
+func TestLoad_Blocks(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cacheCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		c := New[string, int](cacheCtx)
+
+		task, release := blockingTask(func(ctx context.Context) (int, time.Time, error) {
+			return 123, time.Now().Add(time.Hour), nil
+		})
+
+		go func() {
+			_, _ = c.Store(context.Background(), "key", task)
+		}()
+
+		// Wait for Store() to start doing the work
+		synctest.Wait()
+
+		var result int
+		var ok bool
+		var err error
+
+		go func() {
+			result, ok, err = c.Load(context.Background(), "key")
+		}()
+
+		// Wait for Load to block
+		synctest.Wait()
+
+		// Release the call to Store
+		release()
+
+		// Wait for both calls to return
+		synctest.Wait()
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !ok {
+			t.Fatalf("expected cache hit")
+		}
+		if result != 123 {
+			t.Fatalf("got %v, want %v", result, 123)
+		}
+	})
+}
+
+func TestLoadOrStore_CacheMissHit(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cacheCtx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -53,7 +144,7 @@ func blockingTask[V any](task Task[V]) (Task[V], func()) {
 	}, func() { close(block) }
 }
 
-func TestLoad_CoalesceUnitsOfWork(t *testing.T) {
+func TestLoadOrStore_CoalesceUnitsOfWork(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cacheCtx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -76,20 +167,20 @@ func TestLoad_CoalesceUnitsOfWork(t *testing.T) {
 			resultA, cacheHitA, errA = c.LoadOrStore(context.Background(), "key", taskA)
 		}()
 
-		// Wait for the first Load call to start doing the work
+		// Wait for the first LoadOrStore call to start doing the work
 		synctest.Wait()
 
 		go func() {
 			resultB, cacheHitB, errB = c.LoadOrStore(context.Background(), "key", taskB)
 		}()
 
-		// Wait for the second Load call to become blocked
+		// Wait for the second LoadOrStore call to become blocked
 		synctest.Wait()
 
 		// Release the first task
 		releaseA()
 
-		// Wait for (hopefully) both Load calls to return
+		// Wait for (hopefully) both LoadOrStore calls to return
 		synctest.Wait()
 
 		if resultA != 123 {
@@ -115,7 +206,7 @@ func TestLoad_CoalesceUnitsOfWork(t *testing.T) {
 	})
 }
 
-func TestLoad_ContextCancellations(t *testing.T) {
+func TestLoadOrStore_ContextCancellations(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cacheCtx, cacheCtxCancel := context.WithCancel(context.Background())
 		defer cacheCtxCancel()
@@ -138,12 +229,12 @@ func TestLoad_ContextCancellations(t *testing.T) {
 			v, hit, err = c.LoadOrStore(loadCtx, "key", taskA)
 		}()
 
-		// Wait for Load to block
+		// Wait for LoadOrStore to block
 		synctest.Wait()
 
 		cancel()
 
-		// Wait for Load to return
+		// Wait for LoadOrStore to return
 		synctest.Wait()
 
 		if v != 0 {
@@ -162,7 +253,7 @@ func TestLoad_ContextCancellations(t *testing.T) {
 	})
 }
 
-func TestLoad_Error(t *testing.T) {
+func TestLoadOrStore_Error(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		cacheCtx, cacheCtxCancel := context.WithCancel(context.Background())
 		defer cacheCtxCancel()
@@ -199,7 +290,7 @@ func TestLoad_Error(t *testing.T) {
 		}
 
 		// When we release task A, it should return an error, but
-		// the second call to Load should not observe the error.
+		// the second call to LoadOrStore should not observe the error.
 		releaseA()
 
 		synctest.Wait()
@@ -226,10 +317,10 @@ func TestLoad_Error(t *testing.T) {
 	})
 }
 
-func TestLoad_ContextCancelThenError(t *testing.T) {
+func TestLoadOrStore_ContextCancelThenError(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 
-		// Test that if the initiating goroutine is cancelled,
+		// Test that if the initiating goroutine is canceled,
 		// but the work goes on to return an error, we don't
 		// get deadlock.
 
@@ -251,10 +342,10 @@ func TestLoad_ContextCancelThenError(t *testing.T) {
 			v, hit, err = c.LoadOrStore(loadCtx, "key", task)
 		}()
 
-		// Wait for Load to block
+		// Wait for LoadOrStore to block
 		synctest.Wait()
 
-		// Cancel the context so that Load returns immediately,
+		// Cancel the context so that LoadOrStore returns immediately,
 		// before the task has completed.
 		cancel()
 
@@ -278,7 +369,7 @@ func TestLoad_ContextCancelThenError(t *testing.T) {
 	})
 }
 
-func TestLoad_Expired(t *testing.T) {
+func TestLoadOrStore_Expired(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 
 		cacheCtx, cacheCtxCancel := context.WithCancel(context.Background())

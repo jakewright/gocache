@@ -72,6 +72,63 @@ func OptionJanitorFrequency(d time.Duration) func(*options) {
 // not present in the cache, or the entry has expired.
 type Task[V any] func(ctx context.Context) (result V, expiry time.Time, err error)
 
+// Load returns the cached value if present.
+// The boolean indicates whether a value was found.
+// If there is currently in-flight work for the key, Load will wait for it to
+// complete. Note that if the in-flight work returns a non-nil error, the result
+// will not be cached and thus not returned to the caller of Load.
+func (c *Cache[K, V]) Load(ctx context.Context, key K) (V, bool, error) {
+	return c.LoadOrStore(ctx, key, nil)
+}
+
+// Store will execute the task and cache the result.
+// If the task returns a non-nil error, the result will not be cached.
+// Store will wait for any existing in-flight work for the key to complete
+// before executing the task.
+func (c *Cache[K, V]) Store(ctx context.Context, key K, task Task[V]) (V, error) {
+	for {
+		c.mutex.Lock()
+
+		// To maintain the invariant of one in-flight task per key at a time,
+		// we wait for any existing in-flight work to complete.
+		inFlightTask, ok := c.inFlight[key]
+		if ok {
+			c.mutex.Unlock()
+
+			select {
+			case <-inFlightTask.ctx.Done():
+				continue
+
+			// If the caller's context expires, return early.
+			case <-ctx.Done():
+				return *new(V), ctx.Err()
+			}
+		}
+
+		// No in-flight work. Evict any existing entry.
+		if _, ok := c.entries[key]; ok {
+			delete(c.entries, key)
+		}
+
+		inFlightTask = newInFlight[V](ctx)
+		c.inFlight[key] = inFlightTask
+
+		c.addWatcher(ctx, key)
+		c.mutex.Unlock()
+
+		// Execute the task in a separate goroutine
+		c.doTask(key, inFlightTask, task)
+
+		select {
+		case <-inFlightTask.ctx.Done():
+		case <-ctx.Done():
+			return *new(V), ctx.Err()
+		}
+
+		return inFlightTask.result, inFlightTask.err
+	}
+}
+
 // LoadOrStore returns the cached value if present and not expired. In this
 // case, cacheHit will be true. Otherwise, it executes the task and returns the
 // result. If the task returns without error, the result is cached for future
@@ -88,6 +145,9 @@ type Task[V any] func(ctx context.Context) (result V, expiry time.Time, err erro
 func (c *Cache[K, V]) LoadOrStore(ctx context.Context, key K, task Task[V]) (result V, cacheHit bool, err error) {
 	// If the cache's context is closed, bypass the cache.
 	if c.ctx.Err() != nil {
+		if task == nil {
+			return *new(V), false, nil
+		}
 		v, _, err := task(ctx)
 		return v, false, err
 	}
@@ -120,7 +180,7 @@ func (c *Cache[K, V]) LoadOrStore(ctx context.Context, key K, task Task[V]) (res
 		// Check for in-flight work
 		inFlightTask, ok := c.inFlight[key]
 		if ok {
-			// Register ourselves as a watcher so this task does not get cancelled.
+			// Register ourselves as a watcher so this task does not get canceled.
 			// We must do this before giving up the lock.
 			c.addWatcher(ctx, key)
 			c.mutex.Unlock()
@@ -141,43 +201,20 @@ func (c *Cache[K, V]) LoadOrStore(ctx context.Context, key K, task Task[V]) (res
 		// No cached entry and no in-flight work;
 		// it is our responsibility to perform the task.
 
+		// Return early if task is nil
+		if task == nil {
+			c.mutex.Unlock()
+			return *new(V), false, nil
+		}
+
 		inFlightTask = newInFlight[V](ctx)
 		c.inFlight[key] = inFlightTask
 
 		c.addWatcher(ctx, key)
 		c.mutex.Unlock()
 
-		go func() {
-			v, expires, err := task(inFlightTask.ctx)
-
-			c.mutex.Lock()
-			defer func() {
-				// Remove the in-flight task from the map
-				delete(c.inFlight, key)
-
-				// Cancel the task's context to signal to watchers that the task has completed
-				inFlightTask.cancel()
-
-				c.mutex.Unlock()
-			}()
-
-			inFlightTask.result = v
-			inFlightTask.err = err
-
-			// Return early if there was an error; do not cache the result.
-			if err != nil {
-				return
-			}
-
-			if c.maxSize > 0 && len(c.entries) == c.maxSize {
-				c.evictRandomUnsafe()
-			}
-
-			c.entries[key] = &entry[V]{
-				value:   v,
-				expires: expires,
-			}
-		}()
+		// Execute the task in a separate goroutine
+		c.doTask(key, inFlightTask, task)
 
 		select {
 		case <-inFlightTask.ctx.Done():
@@ -186,13 +223,43 @@ func (c *Cache[K, V]) LoadOrStore(ctx context.Context, key K, task Task[V]) (res
 		}
 
 		// Since we started the work, we must return the error to the caller.
-		if inFlightTask.err != nil {
-			return *new(V), false, inFlightTask.err
+		// It's important to signal that this was not a cache hit
+		return inFlightTask.result, false, inFlightTask.err
+	}
+}
+
+func (c *Cache[K, V]) doTask(key K, inFlightTask *inFlight[V], task Task[V]) {
+	go func() {
+		v, expires, err := task(inFlightTask.ctx)
+
+		c.mutex.Lock()
+		defer func() {
+			// Remove the in-flight task from the map
+			delete(c.inFlight, key)
+
+			// Cancel the task's context to signal to watchers that the task has completed
+			inFlightTask.cancel()
+
+			c.mutex.Unlock()
+		}()
+
+		inFlightTask.result = v
+		inFlightTask.err = err
+
+		// Return early if there was an error; do not cache the result.
+		if err != nil {
+			return
 		}
 
-		// It's important to signal that this was not a cache hit
-		return inFlightTask.result, false, nil
-	}
+		if c.maxSize > 0 && len(c.entries) == c.maxSize {
+			c.evictRandomUnsafe()
+		}
+
+		c.entries[key] = &entry[V]{
+			value:   v,
+			expires: expires,
+		}
+	}()
 }
 
 type entry[V any] struct {
