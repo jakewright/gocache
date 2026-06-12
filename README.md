@@ -10,6 +10,8 @@ go get github.com/jakewright/gocache
 
 ## Usage
 
+[View the full documentation on pkg.go.dev](https://pkg.go.dev/github.com/jakewright/gocache)
+
 ```go
 ctx, cancel := context.WithCancel(context.Background())
 
